@@ -1,6 +1,7 @@
 const asyncHandler = require("../utils/asyncHandler");
 const Energy = require("../models/energy");
 const Client = require("../models/clients");
+const CommunityBattery = require("../models/communityBattery");
 const axios = require("axios");
 
 // Panel capacity map
@@ -196,6 +197,90 @@ const addEnergy = asyncHandler(async (req, res) => {
 });
 
 
+const getLiveProduction = asyncHandler(async (req, res) => {
+  try {
+    // Normalize date to UTC midnight (same as your addEnergy controller)
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+
+    // Get all active clients
+    const clients = await Client.find({ 
+      status: 'active', 
+      isDeleted: false 
+    }).select('firstName lastName walletAddress energyBalance solarPanel location lat lon userType status isDeleted');
+
+    // Get today's energy production for all clients in one query
+    const todayEnergy = await Energy.find({
+      date: today,
+      client: { $in: clients.map(client => client._id) }
+    }).populate('client', 'firstName lastName walletAddress');
+
+    // Create a map for quick lookup
+    const energyMap = new Map();
+    todayEnergy.forEach(energy => {
+      energyMap.set(energy.client._id.toString(), energy);
+    });
+
+    // Format response data client-wise
+    const clientProductions = clients.map(client => {
+      const energyRecord = energyMap.get(client._id.toString());
+      const dailyProductionKwh = energyRecord ? 
+        parseFloat(energyRecord.dailyProductionKwh.toFixed(6)) : 0;
+
+      return {
+        clientId: client._id,
+        name: `${client.firstName || ''} ${client.lastName || ''}`.trim() || 'Anonymous',
+        walletAddress: client.walletAddress,
+        energyBalance: parseFloat(client.energyBalance.toFixed(6)),
+        dailyProductionKwh: dailyProductionKwh,
+        estimatedDailyProductionKwh: client.estimatedDailyProductionKwh,
+        location: client.location,
+        coordinates: client.lat && client.lon ? 
+          { lat: client.lat, lon: client.lon } : null,
+        userType: client.userType,
+        solarPanelSize: client.solarPanel?.size || 'medium',
+        status: client.status,
+        lastUpdated: energyRecord?.updatedAt || null,
+        energyRecordId: energyRecord?._id || null
+      };
+    });
+
+    // Calculate totals (similar to your structure)
+    const totalEnergyProduced = clientProductions.reduce((sum, client) => 
+      sum + client.dailyProductionKwh, 0
+    );
+    
+    const totalEnergyBalance = clientProductions.reduce((sum, client) => 
+      sum + client.energyBalance, 0
+    );
+
+    return res.status(200).json({
+      status: "success",
+      message: "Live energy production data fetched successfully",
+      data: {
+        clients: clientProductions,
+        totals: {
+          totalClients: clientProductions.length,
+          totalEnergyProduced: parseFloat(totalEnergyProduced.toFixed(6)),
+          totalEnergyBalance: parseFloat(totalEnergyBalance.toFixed(6))
+        },
+        timestamp: new Date().toISOString(),
+        date: today
+      }
+    });
+
+  } catch (error) {
+    console.error('Dashboard API Error:', error);
+    return res.status(500).json({
+      status: "error",
+      message: "Error fetching live production data",
+      error: error.message
+    });
+  }
+});
+
+
+
 /*
 ------------------------------------------------
  BULK ENERGY USING REAL WEATHER
@@ -251,4 +336,391 @@ const addBulkEnergy = asyncHandler(async (req, res) => {
   });
 });
 
-module.exports = { getClientEnergy, addEnergy, addBulkEnergy };
+
+const getTotalEnergyProduction = asyncHandler(async (req, res) => {
+  const { period = 'today' } = req.query; // today, week, month, year
+  
+  let startDate, endDate = new Date();
+  
+  switch (period) {
+    case 'today':
+      startDate = new Date();
+      startDate.setHours(0, 0, 0, 0);
+      break;
+    case 'week':
+      startDate = new Date();
+      startDate.setDate(startDate.getDate() - 7);
+      break;
+    case 'month':
+      startDate = new Date();
+      startDate.setMonth(startDate.getMonth() - 1);
+      break;
+    case 'year':
+      startDate = new Date();
+      startDate.setFullYear(startDate.getFullYear() - 1);
+      break;
+    default:
+      startDate = new Date();
+      startDate.setHours(0, 0, 0, 0);
+  }
+
+  // Get total energy production
+  const totalProduction = await Energy.aggregate([
+    {
+      $match: {
+        date: { $gte: startDate, $lte: endDate }
+      }
+    },
+    {
+      $group: {
+        _id: null,
+        totalProduction: { $sum: "$dailyProductionKwh" },
+        recordCount: { $sum: 1 }
+      }
+    }
+  ]);
+
+  // Get active clients count
+  const activeClients = await Client.countDocuments({ 
+    status: "active", 
+    isDeleted: false 
+  });
+
+  // Get today's production for comparison
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+  
+  const yesterdayStart = new Date(todayStart);
+  yesterdayStart.setDate(yesterdayStart.getDate() - 1);
+
+  const todayProduction = await Energy.aggregate([
+    {
+      $match: {
+        date: { $gte: todayStart, $lte: endDate }
+      }
+    },
+    {
+      $group: {
+        _id: null,
+        total: { $sum: "$dailyProductionKwh" }
+      }
+    }
+  ]);
+
+  const yesterdayProduction = await Energy.aggregate([
+    {
+      $match: {
+        date: { $gte: yesterdayStart, $lt: todayStart }
+      }
+    },
+    {
+      $group: {
+        _id: null,
+        total: { $sum: "$dailyProductionKwh" }
+      }
+    }
+  ]);
+
+  const todayTotal = todayProduction[0]?.total || 0;
+  const yesterdayTotal = yesterdayProduction[0]?.total || 0;
+  
+  // Calculate percentage change
+  let percentageChange = 0;
+  if (yesterdayTotal > 0) {
+    percentageChange = ((todayTotal - yesterdayTotal) / yesterdayTotal) * 100;
+  }
+
+  return res.json({
+    status: "success",
+    data: {
+      period,
+      totalProduction: parseFloat((totalProduction[0]?.totalProduction || 0).toFixed(2)),
+      averagePerClient: parseFloat(((totalProduction[0]?.totalProduction || 0) / activeClients).toFixed(2)),
+      activeClients,
+      recordCount: totalProduction[0]?.recordCount || 0,
+      todayProduction: parseFloat(todayTotal.toFixed(2)),
+      percentageChange: parseFloat(percentageChange.toFixed(1)),
+      timeRange: {
+        start: startDate,
+        end: endDate
+      }
+    }
+  });
+});
+
+/*
+------------------------------------------------
+ GET ENERGY TRADE TODAY
+------------------------------------------------
+*/
+const getEnergyTradeToday = asyncHandler(async (req, res) => {
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+  
+  const todayEnd = new Date();
+  todayEnd.setHours(23, 59, 59, 999);
+
+  // Get community battery transactions for today
+  const battery = await CommunityBattery.findOne()
+    .populate('deposits.client', 'firstName lastName')
+    .populate('releases.client', 'firstName lastName');
+
+  if (!battery) {
+    return res.json({
+      status: "success",
+      data: {
+        totalTraded: 0,
+        totalDeposits: 0,
+        totalReleases: 0,
+        totalValue: 0,
+        deposits: [],
+        releases: [],
+        hourlyFlow: generateEmptyHourlyFlow()
+      }
+    });
+  }
+
+  // Filter today's transactions
+  const todayDeposits = battery.deposits.filter(deposit => 
+    deposit.depositedAt >= todayStart && deposit.depositedAt <= todayEnd
+  );
+
+  const todayReleases = battery.releases.filter(release => 
+    release.releasedAt >= todayStart && release.releasedAt <= todayEnd
+  );
+
+  // Calculate totals
+  const totalDeposits = todayDeposits.reduce((sum, deposit) => sum + deposit.amountKwh, 0);
+  const totalReleases = todayReleases.reduce((sum, release) => sum + release.amountKwh, 0);
+  const totalTraded = totalDeposits + totalReleases;
+  const totalValue = (totalDeposits * battery.energyPricePerKwh) + (totalReleases * battery.energyPricePerKwh);
+
+  // Generate hourly flow data
+  const hourlyFlow = generateHourlyFlowData(todayDeposits, todayReleases);
+
+  return res.json({
+    status: "success",
+    data: {
+      totalTraded: parseFloat(totalTraded.toFixed(2)),
+      totalDeposits: parseFloat(totalDeposits.toFixed(2)),
+      totalReleases: parseFloat(totalReleases.toFixed(2)),
+      totalValue: parseFloat(totalValue.toFixed(2)),
+      currentPrice: parseFloat(battery.energyPricePerKwh.toFixed(4)),
+      transactionCount: todayDeposits.length + todayReleases.length,
+      deposits: todayDeposits.map(d => ({
+        id: d._id,
+        client: d.client,
+        amountKwh: parseFloat(d.amountKwh.toFixed(2)),
+        pricePerKwh: parseFloat(d.pricePerKwh.toFixed(4)),
+        totalEarnings: parseFloat(d.totalEarnings.toFixed(2)),
+        timestamp: d.depositedAt
+      })),
+      releases: todayReleases.map(r => ({
+        id: r._id,
+        client: r.client,
+        amountKwh: parseFloat(r.amountKwh.toFixed(2)),
+        pricePerKwh: parseFloat(r.pricePerKwh.toFixed(4)),
+        totalCost: parseFloat(r.totalCost.toFixed(2)),
+        timestamp: r.releasedAt
+      })),
+      hourlyFlow
+    }
+  });
+});
+
+/*
+------------------------------------------------
+ GET REAL-TIME ENERGY FLOW
+------------------------------------------------
+*/
+const getRealTimeEnergyFlow = asyncHandler(async (req, res) => {
+  const now = new Date();
+  const currentHour = now.getHours();
+  
+  // Generate time slots for the last 12 hours
+  const timeSlots = [];
+  for (let i = 11; i >= 0; i--) {
+    const hour = (currentHour - i + 24) % 24;
+    timeSlots.push({
+      time: `${hour.toString().padStart(2, '0')}:00`,
+      hour: hour
+    });
+  }
+
+  // Get production data for today
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+  
+  const energyData = await Energy.aggregate([
+    {
+      $match: {
+        date: { $gte: todayStart }
+      }
+    },
+    {
+      $group: {
+        _id: { $hour: "$createdAt" },
+        production: { $sum: "$dailyProductionKwh" },
+        recordCount: { $sum: 1 }
+      }
+    },
+    {
+      $sort: { _id: 1 }
+    }
+  ]);
+
+  // Get trading data for today from community battery
+  const battery = await CommunityBattery.findOne();
+  let tradingData = [];
+  
+  if (battery) {
+    tradingData = await getTradingDataByHour(battery, todayStart);
+  }
+
+  // Combine data into time slots
+  const flowData = timeSlots.map(slot => {
+    const productionRecord = energyData.find(d => d._id === slot.hour);
+    const tradingRecord = tradingData.find(d => d.hour === slot.hour);
+    
+    // Simulate consumption based on production and time of day
+    const baseConsumption = getBaseConsumption(slot.hour);
+    const production = productionRecord ? productionRecord.production / productionRecord.recordCount : 0;
+    const trading = tradingRecord ? tradingRecord.trading : 0;
+    const consumption = baseConsumption + (production * 0.3); // Consumption increases with production
+
+    return {
+      time: slot.time,
+      production: parseFloat(production.toFixed(2)),
+      consumption: parseFloat(consumption.toFixed(2)),
+      trading: parseFloat(trading.toFixed(2)),
+      netFlow: parseFloat((production - consumption).toFixed(2))
+    };
+  });
+
+  // Get current system status
+  const currentProduction = flowData[flowData.length - 1]?.production || 0;
+  const currentConsumption = flowData[flowData.length - 1]?.consumption || 0;
+  const currentTrading = flowData[flowData.length - 1]?.trading || 0;
+
+  return res.json({
+    status: "success",
+    data: {
+      current: {
+        production: currentProduction,
+        consumption: currentConsumption,
+        trading: currentTrading,
+        netFlow: parseFloat((currentProduction - currentConsumption).toFixed(2)),
+        timestamp: now
+      },
+      hourlyFlow: flowData,
+      summary: {
+        totalProduction: parseFloat(flowData.reduce((sum, d) => sum + d.production, 0).toFixed(2)),
+        totalConsumption: parseFloat(flowData.reduce((sum, d) => sum + d.consumption, 0).toFixed(2)),
+        totalTrading: parseFloat(flowData.reduce((sum, d) => sum + d.trading, 0).toFixed(2))
+      }
+    }
+  });
+});
+
+// Helper function to generate hourly flow data for trading
+async function getTradingDataByHour(battery, todayStart) {
+  const todayEnd = new Date(todayStart);
+  todayEnd.setHours(23, 59, 59, 999);
+
+  const todayDeposits = battery.deposits.filter(d => 
+    d.depositedAt >= todayStart && d.depositedAt <= todayEnd
+  );
+  
+  const todayReleases = battery.releases.filter(r => 
+    r.releasedAt >= todayStart && r.releasedAt <= todayEnd
+  );
+
+  const hourlyData = {};
+  
+  // Initialize all hours
+  for (let hour = 0; hour < 24; hour++) {
+    hourlyData[hour] = { trading: 0 };
+  }
+  
+  // Sum deposits by hour
+  todayDeposits.forEach(deposit => {
+    const hour = new Date(deposit.depositedAt).getHours();
+    hourlyData[hour].trading += deposit.amountKwh;
+  });
+  
+  // Sum releases by hour
+  todayReleases.forEach(release => {
+    const hour = new Date(release.releasedAt).getHours();
+    hourlyData[hour].trading += release.amountKwh;
+  });
+
+  return Object.entries(hourlyData).map(([hour, data]) => ({
+    hour: parseInt(hour),
+    trading: data.trading
+  }));
+}
+
+// Helper function to generate base consumption based on time of day
+function getBaseConsumption(hour) {
+  // Consumption pattern: low at night, peaks in morning and evening
+  if (hour >= 0 && hour < 6) return 5 + Math.random() * 5; // Night
+  if (hour >= 6 && hour < 9) return 15 + Math.random() * 10; // Morning peak
+  if (hour >= 9 && hour < 17) return 10 + Math.random() * 8; // Day
+  if (hour >= 17 && hour < 22) return 20 + Math.random() * 15; // Evening peak
+  return 8 + Math.random() * 6; // Late evening
+}
+
+// Helper function to generate hourly flow data
+function generateHourlyFlowData(deposits, releases) {
+  const hourlyData = {};
+  
+  // Initialize all hours with 0
+  for (let hour = 0; hour < 24; hour++) {
+    hourlyData[hour] = { deposits: 0, releases: 0 };
+  }
+  
+  // Sum deposits by hour
+  deposits.forEach(deposit => {
+    const hour = new Date(deposit.depositedAt).getHours();
+    hourlyData[hour].deposits += deposit.amountKwh;
+  });
+  
+  // Sum releases by hour
+  releases.forEach(release => {
+    const hour = new Date(release.releasedAt).getHours();
+    hourlyData[hour].releases += release.amountKwh;
+  });
+
+  // Convert to array format for chart
+  return Object.entries(hourlyData).map(([hour, data]) => ({
+    time: `${hour.toString().padStart(2, '0')}:00`,
+    deposits: parseFloat(data.deposits.toFixed(2)),
+    releases: parseFloat(data.releases.toFixed(2)),
+    netFlow: parseFloat((data.deposits - data.releases).toFixed(2))
+  }));
+}
+
+// Helper function for empty hourly flow
+function generateEmptyHourlyFlow() {
+  const flow = [];
+  for (let hour = 0; hour < 24; hour++) {
+    flow.push({
+      time: `${hour.toString().padStart(2, '0')}:00`,
+      deposits: 0,
+      releases: 0,
+      netFlow: 0
+    });
+  }
+  return flow;
+}
+
+// Export all functions including the new ones
+module.exports = { 
+  getClientEnergy, 
+  addEnergy, 
+  addBulkEnergy,
+  getTotalEnergyProduction,
+  getEnergyTradeToday,
+  getRealTimeEnergyFlow,
+  getLiveProduction
+};

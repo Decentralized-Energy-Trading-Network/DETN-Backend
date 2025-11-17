@@ -407,6 +407,220 @@ const getTransactionDetails = asyncHandler(async (req, res) => {
   });
 });
 
+
+
+// @desc    Get recent energy transactions
+// @route   GET /api/transactions/recent
+// @access  Public/Private (adjust as needed)
+const getRecentTransactions = asyncHandler(async (req, res) => {
+  const { limit = 10 } = req.query;
+
+  try {
+    const recentOrders = await Order.find({
+      status: 'completed',
+      completedAt: { $ne: null }
+    })
+    .populate('seller', 'firstName lastName walletAddress userType')
+    .populate('buyer', 'firstName lastName walletAddress userType')
+    .sort({ completedAt: -1 })
+    .limit(parseInt(limit))
+    .lean();
+
+    // Transform the data for the frontend
+    const transactions = recentOrders.map(order => {
+      const sellerName = order.seller ? 
+        `${order.seller.firstName || ''} ${order.seller.lastName || ''}`.trim() || 
+        (order.seller.userType === 'factory' ? 'Factory' : 'Household') : 
+        'Unknown Seller';
+      
+      const buyerName = order.buyer ? 
+        `${order.buyer.firstName || ''} ${order.buyer.lastName || ''}`.trim() || 
+        (order.buyer.userType === 'factory' ? 'Factory' : 'Household') : 
+        'Community Grid';
+
+      // Calculate time ago
+      const timeAgo = getTimeAgo(order.completedAt);
+
+      return {
+        id: order._id.toString(),
+        from: sellerName,
+        to: buyerName,
+        amount: order.energyAmount,
+        price: order.pricePerUnit,
+        totalValue: order.energyAmount * order.pricePerUnit,
+        time: timeAgo,
+        completedAt: order.completedAt,
+        sellerWallet: order.seller?.walletAddress,
+        buyerWallet: order.buyer?.walletAddress
+      };
+    });
+
+    res.status(200).json({
+      status: "success",
+      data: {
+        transactions,
+        total: transactions.length
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching recent transactions:', error);
+    res.status(500).json({
+      status: "error",
+      message: "Error fetching recent transactions"
+    });
+  }
+});
+
+// @desc    Get all transactions with pagination and filtering
+// @route   GET /api/transactions
+// @access  Private/Admin
+const getAllTransactions = asyncHandler(async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 20;
+  const status = req.query.status || 'completed';
+  const skip = (page - 1) * limit;
+
+  try {
+    const filter = { status };
+    if (status === 'completed') {
+      filter.completedAt = { $ne: null };
+    }
+
+    const [transactions, total] = await Promise.all([
+      Order.find(filter)
+        .populate('seller', 'firstName lastName walletAddress userType location')
+        .populate('buyer', 'firstName lastName walletAddress userType location')
+        .sort({ completedAt: -1, createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Order.countDocuments(filter)
+    ]);
+
+    const transformedTransactions = transactions.map(order => ({
+      id: order._id.toString(),
+      from: order.seller ? 
+        `${order.seller.firstName || ''} ${order.seller.lastName || ''}`.trim() || 
+        (order.seller.userType === 'factory' ? 'Factory' : 'Household') : 
+        'Unknown Seller',
+      to: order.buyer ? 
+        `${order.buyer.firstName || ''} ${order.buyer.lastName || ''}`.trim() || 
+        (order.buyer.userType === 'factory' ? 'Factory' : 'Household') : 
+        'Community Grid',
+      amount: order.energyAmount,
+      price: order.pricePerUnit,
+      totalValue: order.energyAmount * order.pricePerUnit,
+      time: getTimeAgo(order.completedAt || order.createdAt),
+      status: order.status,
+      completedAt: order.completedAt,
+      createdAt: order.createdAt,
+      sellerType: order.seller?.userType,
+      buyerType: order.buyer?.userType,
+      sellerLocation: order.seller?.location,
+      buyerLocation: order.buyer?.location
+    }));
+
+    res.status(200).json({
+      status: "success",
+      data: {
+        transactions: transformedTransactions,
+        pagination: {
+          page,
+          limit,
+          total,
+          pages: Math.ceil(total / limit)
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching transactions:', error);
+    res.status(500).json({
+      status: "error",
+      message: "Error fetching transactions"
+    });
+  }
+});
+
+// @desc    Get transaction statistics
+// @route   GET /api/transactions/stats
+// @access  Private/Admin
+const getTransactionStats = asyncHandler(async (req, res) => {
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const [todayStats, totalStats, recentActivity] = await Promise.all([
+      // Today's transactions
+      Order.aggregate([
+        {
+          $match: {
+            status: 'completed',
+            completedAt: { $gte: today }
+          }
+        },
+        {
+          $group: {
+            _id: null,
+            totalEnergy: { $sum: '$energyAmount' },
+            totalValue: { $sum: { $multiply: ['$energyAmount', '$pricePerUnit'] } },
+            count: { $sum: 1 }
+          }
+        }
+      ]),
+      // Total statistics
+      Order.aggregate([
+        {
+          $match: { status: 'completed' }
+        },
+        {
+          $group: {
+            _id: null,
+            totalEnergy: { $sum: '$energyAmount' },
+            totalValue: { $sum: { $multiply: ['$energyAmount', '$pricePerUnit'] } },
+            count: { $sum: 1 }
+          }
+        }
+      ]),
+      // Recent activity count (last 7 days)
+      Order.countDocuments({
+        status: 'completed',
+        completedAt: { $gte: new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000) }
+      })
+    ]);
+
+    res.status(200).json({
+      status: "success",
+      data: {
+        today: todayStats[0] || { totalEnergy: 0, totalValue: 0, count: 0 },
+        total: totalStats[0] || { totalEnergy: 0, totalValue: 0, count: 0 },
+        recentActivity
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching transaction stats:', error);
+    res.status(500).json({
+      status: "error",
+      message: "Error fetching transaction statistics"
+    });
+  }
+});
+
+// Helper function to calculate time ago
+function getTimeAgo(date) {
+  if (!date) return 'Unknown time';
+  
+  const now = new Date();
+  const diffInSeconds = Math.floor((now - new Date(date)) / 1000);
+  
+  if (diffInSeconds < 60) return 'Just now';
+  if (diffInSeconds < 3600) return `${Math.floor(diffInSeconds / 60)} min ago`;
+  if (diffInSeconds < 86400) return `${Math.floor(diffInSeconds / 3600)} hours ago`;
+  if (diffInSeconds < 604800) return `${Math.floor(diffInSeconds / 86400)} days ago`;
+  
+  return new Date(date).toLocaleDateString();
+}
+
+
 module.exports = {
   createOrder,
   getOpenOrders,
@@ -415,5 +629,8 @@ module.exports = {
   getMyOrders,
   getClientTransactions,
   getTransactionDetails,
-  getEarnedAndSpentStats
+  getEarnedAndSpentStats,
+  getRecentTransactions,
+  getAllTransactions,
+  getTransactionStats
 };

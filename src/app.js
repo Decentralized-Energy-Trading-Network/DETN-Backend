@@ -11,6 +11,7 @@ const errorHandler = require('./middlewares/errorHandler');
 const responseMiddleware = require("./middlewares/responseMiddleware");
 const clientRoutes = require('./routes/clientRoutes');
 const orderRoutes = require('./routes/orderRoutes');
+const communityBatteryRoutes = require('./routes/communityBatteryRoutes');
 
 dotenv.config();
 connectDB();
@@ -50,6 +51,7 @@ app.use("/api/file", fileUploadRoutes);
 app.use("/api/energy", energyRoutes);
 app.use('/api/clients', clientRoutes);
 app.use('/api/orders', orderRoutes);
+app.use('/api/community-battery', communityBatteryRoutes);
 
 
 
